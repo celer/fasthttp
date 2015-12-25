@@ -27,15 +27,15 @@ import (
 // to the client. Otherwise requests' processing may hang.
 //
 // ServeConn closes c before returning.
-func ServeConn(c net.Conn, handler RequestHandler) error {
+func ServeConn(c net.Conn, handlers []RequestHandler) error {
 	v := serverPool.Get()
 	if v == nil {
 		v = &Server{}
 	}
 	s := v.(*Server)
-	s.Handler = handler
+	s.Handlers = handlers
 	err := s.ServeConn(c)
-	s.Handler = nil
+	s.Handlers = []RequestHandler{}
 	serverPool.Put(v)
 	return err
 }
@@ -46,18 +46,18 @@ var serverPool sync.Pool
 // using the given handler.
 //
 // Serve blocks until the given listener returns permanent error.
-func Serve(ln net.Listener, handler RequestHandler) error {
+func Serve(ln net.Listener, handlers []RequestHandler) error {
 	s := &Server{
-		Handler: handler,
+		Handlers: handlers,
 	}
 	return s.Serve(ln)
 }
 
 // ListenAndServe serves HTTP requests from the given TCP addr
 // using the given handler.
-func ListenAndServe(addr string, handler RequestHandler) error {
+func ListenAndServe(addr string, handlers []RequestHandler) error {
 	s := &Server{
-		Handler: handler,
+		Handlers: handlers,
 	}
 	return s.ListenAndServe(addr)
 }
@@ -68,9 +68,9 @@ func ListenAndServe(addr string, handler RequestHandler) error {
 // The function deletes existing file at addr before starting serving.
 //
 // The server sets the given file mode for the UNIX addr.
-func ListenAndServeUNIX(addr string, mode os.FileMode, handler RequestHandler) error {
+func ListenAndServeUNIX(addr string, mode os.FileMode, handlers []RequestHandler) error {
 	s := &Server{
-		Handler: handler,
+		Handlers: handlers,
 	}
 	return s.ListenAndServeUNIX(addr, mode)
 }
@@ -79,9 +79,9 @@ func ListenAndServeUNIX(addr string, mode os.FileMode, handler RequestHandler) e
 // using the given handler.
 //
 // certFile and keyFile are paths to TLS certificate and key files.
-func ListenAndServeTLS(addr, certFile, keyFile string, handler RequestHandler) error {
+func ListenAndServeTLS(addr, certFile, keyFile string, handlers []RequestHandler) error {
 	s := &Server{
-		Handler: handler,
+		Handlers: handlers,
 	}
 	return s.ListenAndServeTLS(addr, certFile, keyFile)
 }
@@ -104,8 +104,8 @@ type RequestHandler func(ctx *RequestCtx)
 //
 // It is safe to call Server methods from concurrently running goroutines.
 type Server struct {
-	// Handler for processing incoming requests.
-	Handler RequestHandler
+	//Request Handler Chain
+	Handlers []RequestHandler
 
 	// Server name for sending in response headers.
 	//
@@ -186,15 +186,7 @@ type Server struct {
 	//
 	// Server accepts all the requests by default.
 	GetOnly bool
-
-	// On100Continue Handler a header Expect: 100-continue
-	//
-	// Per HTTP/1.1 on a Put or Post request the client
-	// can provide a header tag which indicates the client
-	// wants an OK from the server before sending the body.
-	// By default we'll OK all requests with 100-contunue.
-	On100Continue func(req *Request) bool
-
+	
 	// Logger, which is used by RequestCtx.Logger().
 	//
 	// By default standard logger from log package is used.
@@ -280,6 +272,8 @@ type RequestCtx struct {
 	c      net.Conn
 	fbr    firstByteReader
 
+	Reader *bufio.Reader
+
 	timeoutResponse *Response
 	timeoutCh       chan struct{}
 	timeoutTimer    *time.Timer
@@ -331,6 +325,10 @@ func (ctx *RequestCtx) Hijack(handler HijackHandler) {
 // All the values stored in ctx are deleted after returning from RequestHandler.
 func (ctx *RequestCtx) SetUserValue(key string, value interface{}) {
 	ctx.userValues.Set(key, value)
+}
+
+func (ctx *RequestCtx) Connection() net.Conn {
+	return ctx.c
 }
 
 // SetUserValueBytes stores the given value (arbitrary object)
@@ -766,6 +764,16 @@ func (ctx *RequestCtx) SetBodyStream(bodyStream io.Reader, bodySize int) {
 	ctx.Response.SetBodyStream(bodyStream, bodySize)
 }
 
+// Get the request body stream
+//
+// This can be utilized to implement your own streaming body handler
+// To do so set MaxRequestBodySize to -1 and then call this function
+// In your handler. After doing so then you will need to impelement
+// The appropriate streaming handlers
+func (ctx *RequestCtx) RequestBodyStream() io.Reader {
+	return ctx.c
+}
+
 // SetBodyStreamWriter registers the given stream writer for populating
 // response body.
 //
@@ -1082,25 +1090,27 @@ func (s *Server) serveConn(c net.Conn) error {
 				break
 			}
 		}
-
-		if !(s.ReduceMemoryUsage || ctx.lastReadDuration > time.Second) || br != nil {
-			if br == nil {
+		if br == nil {
 				br = acquireReader(ctx)
-			}
-			err = ctx.Request.readLimitBody(br, s.MaxRequestBodySize, s.GetOnly, ctx.c, s.On100Continue)
-			if br.Buffered() == 0 || err != nil {
-				releaseReader(s, br)
-				br = nil
-			}
-		} else {
-			br, err = acquireByteReader(&ctx)
-			if err == nil {
-				err = ctx.Request.ReadLimitBody(br, s.MaxRequestBodySize, ctx.c, s.On100Continue)
-				if br.Buffered() == 0 || err != nil {
-					releaseReader(s, br)
-					br = nil
+		}
+
+		ctx.Response.Reset()
+		ctx.Reader=br
+		err=ctx.Request.parseHeader(br)
+		if(err==nil){
+			for _,handler:=range s.Handlers {
+				handler(ctx)
+				if(err!=nil){
+					break
 				}
 			}
+		}
+
+		ctx.Request.Reset()
+
+		if br.Buffered() == 0 || err != nil {
+			releaseReader(s, br)
+			br = nil
 		}
 
 		currentTime = time.Now()
@@ -1116,8 +1126,6 @@ func (s *Server) serveConn(c net.Conn) error {
 		ctx.connRequestNum = connRequestNum
 		ctx.connTime = connTime
 		ctx.time = currentTime
-		ctx.Response.Reset()
-		s.Handler(ctx)
 
 		hijackHandler = ctx.hijackHandler
 		ctx.hijackHandler = nil

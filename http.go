@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"os"
 	"sync"
+	"mime/multipart"
 )
 
 // Request represents HTTP request.
@@ -341,21 +341,6 @@ func (req *Request) MultipartForm() (*multipart.Form, error) {
 	return f, nil
 }
 
-func readMultipartFormBody(r io.Reader, boundary []byte, maxBodySize, maxInMemoryFileSize int) (*multipart.Form, error) {
-	// Do not care about memory allocations here, since they are tiny
-	// compared to multipart data (aka multi-MB files) usually sent
-	// in multipart/form-data requests.
-
-	if maxBodySize > 0 {
-		r = io.LimitReader(r, int64(maxBodySize))
-	}
-	mr := multipart.NewReader(r, string(boundary))
-	f, err := mr.ReadForm(int64(maxInMemoryFileSize))
-	if err != nil {
-		return nil, fmt.Errorf("cannot read multipart/form-data body: %s", err)
-	}
-	return f, nil
-}
 
 // Reset clears request contents.
 func (req *Request) Reset() {
@@ -395,30 +380,11 @@ func (resp *Response) resetSkipHeader() {
 	resp.body = resp.body[:0]
 }
 
-// Read reads request (including body) from the given r.
-//
-// RemoveMultipartFormFiles or Reset must be called after
-// reading multipart/form-data request in order to delete temporarily
-// uploaded files.
-func (req *Request) Read(r *bufio.Reader, w io.Writer, on100Continue func(req *Request) bool) error {
-	return req.ReadLimitBody(r, 0, w, on100Continue)
-}
 
 const defaultMaxInMemoryFileSize = 16 * 1024 * 1024
 
 var errGetOnly = errors.New("non-GET request received")
 
-// ReadLimitBody reads request from the given r, limiting the body size.
-//
-// If maxBodySize > 0 and the body size exceeds maxBodySize,
-// then ErrBodyTooLarge is returned.
-//
-// RemoveMultipartFormFiles or Reset must be called after
-// reading multipart/form-data request in order to delete temporarily
-// uploaded files.
-func (req *Request) ReadLimitBody(r *bufio.Reader, maxBodySize int, w io.Writer, on100Continue func(req *Request) bool) error {
-	return req.readLimitBody(r, maxBodySize, false, w, on100Continue)
-}
 
 func (req *Request) HasBody() bool {
 	if len(req.Header.Peek("Content-Length")) > 0 && req.Header.ContentLength() > 0 {
@@ -430,64 +396,16 @@ func (req *Request) HasBody() bool {
 	return false
 }
 
-func (req *Request) readLimitBody(r *bufio.Reader, maxBodySize int, getOnly bool, w io.Writer, on100Continue func(req *Request) bool) error {
+
+func (req *Request) parseHeader(r *bufio.Reader) error {
 	req.resetSkipHeader()
 	err := req.Header.Read(r)
 	if err != nil {
 		return err
 	}
-	if getOnly && !req.Header.IsGet() {
-		return errGetOnly
-	}
-
-	if !req.Header.noBody() {
-		contentLength := req.Header.ContentLength()
-		if contentLength > 0 {
-			// See http://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html for 100-Continue behavior
-			expect := req.Header.Peek("Expect")
-			if len(expect) > 0 {
-				lowercaseBytes(expect)
-				if bytes.Compare(expect, []byte("100-continue")) == 0 {
-					if on100Continue == nil || on100Continue(req) {
-						w.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
-					} else {
-						w.Write([]byte("HTTP/1.1 417 Expectation Failed\r\n\r\n"))
-					}
-				} else {
-					w.Write([]byte("HTTP/1.1 417 Expectation Failed\r\n\r\n"))
-				}
-			}
-
-			// Pre-read multipart form data of known length.
-			// This way we limit memory usage for large file uploads, since their contents
-			// is streamed into temporary files if file size exceeds defaultMaxInMemoryFileSize.
-			boundary := req.Header.MultipartFormBoundary()
-			if len(boundary) > 0 {
-				if contentLength > 0 {
-					//We were stalling on waiting for an ending CRLF, RFC2616/4.1 "an HTTP/1.1 client must not preface or follow request with an extra CRLF"
-					//which was causing curl to hang waiting on a post request
-					maxBodySize = contentLength
-				}
-
-				req.multipartForm, err = readMultipartFormBody(r, boundary, maxBodySize, defaultMaxInMemoryFileSize)
-				if err != nil {
-					req.Reset()
-				}
-				return err
-			}
-		}
-
-		if req.HasBody() {
-			req.body, err = readBody(r, contentLength, maxBodySize, req.body)
-			if err != nil {
-				req.Reset()
-				return err
-			}
-			req.Header.SetContentLength(len(req.body))
-		}
-	}
 	return nil
 }
+
 
 // Read reads response (including body) from the given r.
 func (resp *Response) Read(r *bufio.Reader) error {
